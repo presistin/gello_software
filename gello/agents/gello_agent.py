@@ -105,6 +105,20 @@ PORT_CONFIG_MAP: Dict[str, DynamixelRobotConfig] = {
         joint_signs=(1, 1, -1, 1, 1, 1),
         gripper_config=(7, 286, 248),
     ),
+    # My UR + GELLO
+    "/dev/serial/by-id/usb-FTDI_USB__-__Serial_Converter_FTAUGFNE-if00-port0":DynamixelRobotConfig(
+        joint_ids=(1,2,3,4,5,6),
+        joint_offsets=(
+            2*np.pi/2,
+            3*np.pi/2,
+            2*np.pi/2,
+            2*np.pi/2,
+            2*np.pi/2,
+            3*np.pi/2,
+        ),
+        joint_signs=(1,1,-1,1,1,1),
+        gripper_config=(7,200,158),
+    ),
 }
 
 
@@ -131,3 +145,7 @@ class GelloAgent(Agent):
 
     def act(self, obs: Dict[str, np.ndarray]) -> np.ndarray:
         return self._robot.get_joint_state()
+    # def act(self, obs: Dict[str, np.ndarray]) -> np.ndarray:
+    #     joints = self._robot.get_joint_state()
+    #     print("GRIPPER:", joints[-1])
+    #     return joints

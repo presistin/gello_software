@@ -66,18 +66,30 @@ class RobotEnv:
         observations = {}
         for name, camera in self._camera_dict.items():
             image, depth = camera.read()
-            observations[f"{name}_rgb"] = image
-            observations[f"{name}_depth"] = depth
+            # if name =="wrist":
+            #     observations["image_wrist"]=image
+            # elif name=="base":
+            #     observations["image_base"]=image
+            observations[f"image_{name}"] = image
+            # observations[f"{name}_rgb"] = image
+            # observations[f"{name}_depth"] = depth
+
 
         robot_obs = self._robot.get_observations()
-        assert "joint_positions" in robot_obs
-        assert "joint_velocities" in robot_obs
-        assert "ee_pos_quat" in robot_obs
-        observations["joint_positions"] = robot_obs["joint_positions"]
-        observations["joint_velocities"] = robot_obs["joint_velocities"]
-        observations["ee_pos_quat"] = robot_obs["ee_pos_quat"]
-        observations["gripper_position"] = robot_obs["gripper_position"]
+        observations["joints"]=robot_obs["joint_positions"]
+        observations["gripper"]=np.array(
+            [robot_obs["gripper_position"]]
+        )
+        observations["joint_positions"] = observations["joints"]
         return observations
+        # assert "joint_positions" in robot_obs
+        # assert "joint_velocities" in robot_obs
+        # assert "ee_pos_quat" in robot_obs
+        # observations["joint_positions"] = robot_obs["joint_positions"]
+        # observations["joint_velocities"] = robot_obs["joint_velocities"]
+        # observations["ee_pos_quat"] = robot_obs["ee_pos_quat"]
+        # observations["gripper_position"] = robot_obs["gripper_position"]
+        # return observations
 
 
 def main() -> None:

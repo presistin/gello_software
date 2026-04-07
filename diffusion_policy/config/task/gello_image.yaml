@@ -1,0 +1,31 @@
+name: gello_image
+
+shape_meta:
+  obs:
+    image0:
+      shape: [3, 480, 640]
+      type: rgb
+    image1:
+      shape: [3, 480, 640]
+      type: rgb
+    agent_pos:
+      shape: [7]
+      type: low_dim
+  action:
+    shape: [7]
+
+dataset:
+  _target_: diffusion_policy.dataset.real_pusht_image_dataset.RealPushTImageDataset
+  shape_meta: ${shape_meta}
+  dataset_path: /home/zaq/gello_software/data/gello_replay_buffer.zarr
+
+  horizon: 16
+  pad_before: 1
+  pad_after: 7
+
+  n_obs_steps: 2
+  n_latency_steps: 0
+
+  use_cache: false
+  seed: 42
+  val_ratio: 0.02
