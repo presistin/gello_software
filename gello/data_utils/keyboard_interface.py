@@ -3,10 +3,12 @@ import pygame
 NORMAL = (128, 128, 128)
 RED = (255, 0, 0)
 GREEN = (0, 255, 0)
+BLUE = (0, 0, 255)
 
 KEY_START = pygame.K_s
 KEY_CONTINUE = pygame.K_c
 KEY_QUIT_RECORDING = pygame.K_q
+KEY_DELETE_LAST = pygame.K_d
 
 
 class KBReset:
@@ -18,6 +20,10 @@ class KBReset:
 
     def update(self) -> str:
         pressed_last = self._get_pressed()
+        if KEY_DELETE_LAST in pressed_last:
+            self._set_color(BLUE)
+            return "delete_last"
+
         if KEY_QUIT_RECORDING in pressed_last:
             self._set_color(RED)
             self._saved = False
