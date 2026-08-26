@@ -1,6 +1,7 @@
 import glob
+import sys
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Optional, Tuple
 
 import numpy as np
@@ -9,6 +10,7 @@ import tyro
 from gello.env import RobotEnv
 from gello.robots.robot import PrintRobot
 from gello.utils.launch_utils import instantiate_from_dict
+from gello.utils.serial_ports import resolve_gello_port, resolve_tactile_port
 from gello.zmq_core.robot_node import ZMQClientRobot
 #添加相机类
 from gello.zmq_core.camera_node import ZMQClientCamera
@@ -39,6 +41,27 @@ class Args:
     bimanual: bool = False
     verbose: bool = False
 
+    # 默认 None 保持原来的无限阻塞行为；仅在显式传参时启用故障超时。
+    robot_recv_timeout_ms: Optional[int] = None
+    robot_send_timeout_ms: Optional[int] = None
+    camera_recv_timeout_ms: Optional[int] = None
+    camera_send_timeout_ms: Optional[int] = None
+
+    # 默认关闭，不产生额外文件或控制循环 I/O。
+    runtime_log_dir: Optional[str] = None
+    runtime_log_flush_interval_s: float = 1.0
+
+    # 触觉（高速板 + M3025）：record_tactile 写入 zarr 供 DP 训练；use_tactile_grip_limit 采集防卡死
+    record_tactile: bool = False
+    """为 True 时每帧将 6 维触觉向量存入 replay_buffer.zarr（需重新采集）。"""
+    use_tactile_grip_limit: bool = False
+    tactile_port: Optional[str] = None
+    tactile_force_limit_n: float = 2.0
+    tactile_close_increases: bool = True
+    tactile_baseline_sec: float = 1.5
+    tactile_background_poll_hz: float = 25.0
+    """后台触觉轮询频率；>0 时主循环不阻塞串口。"""
+
     def __post_init__(self):
         if self.start_joints is not None:
             self.start_joints = np.array(self.start_joints)
@@ -53,14 +76,35 @@ def main(args):
         camera_clients = {
 
             # you can optionally add camera nodes here for imitation learning purposes
-            "wrist": ZMQClientCamera(port=args.wrist_camera_port, host=args.hostname),
-            "base": ZMQClientCamera(port=args.base_camera_port, host=args.hostname),
-            "camera_2": ZMQClientCamera(port=5002, host=args.hostname),                 # 新增
+            "wrist": ZMQClientCamera(
+                port=args.wrist_camera_port,
+                host=args.hostname,
+                recv_timeout_ms=args.camera_recv_timeout_ms,
+                send_timeout_ms=args.camera_send_timeout_ms,
+            ),
+            "base": ZMQClientCamera(
+                port=args.base_camera_port,
+                host=args.hostname,
+                recv_timeout_ms=args.camera_recv_timeout_ms,
+                send_timeout_ms=args.camera_send_timeout_ms,
+            ),
+            "camera_2": ZMQClientCamera(
+                port=5002,
+                host=args.hostname,
+                recv_timeout_ms=args.camera_recv_timeout_ms,
+                send_timeout_ms=args.camera_send_timeout_ms,
+            ),                 # 新增
             # "camera_3": ZMQClientCamera(port=5003, host=args.hostname),
         }
-        robot_client = ZMQClientRobot(port=args.robot_port, host=args.hostname)
+        robot_client = ZMQClientRobot(
+            port=args.robot_port,
+            host=args.hostname,
+            recv_timeout_ms=args.robot_recv_timeout_ms,
+            send_timeout_ms=args.robot_send_timeout_ms,
+        )
     env = RobotEnv(robot_client, control_rate_hz=args.hz, camera_dict=camera_clients)
 
+    resolved_gello_port: Optional[str] = None
     agent_cfg = {}
     if args.bimanual:
         if args.agent == "gello":
@@ -129,18 +173,13 @@ def main(args):
             env.step(jnt)
     else:
         if args.agent == "gello":
-            gello_port = args.gello_port
-            if gello_port is None:
-                usb_ports = glob.glob("/dev/serial/by-id/*")
-                # 这个地方存在点小bug：存在多个串口设备（如Arduino）时，直接令搜索到的第一个usb串口赋予gello会报错，所以连接两个的时候注意，或者调用的时候传参串口值
-                print(f"Found {len(usb_ports)} ports")
-                if len(usb_ports) > 0:
-                    gello_port = usb_ports[0]
-                    print(f"using port {gello_port}")
-                else:
-                    raise ValueError(
-                        "No gello port found, please specify one or plug in gello"
-                    )
+            tactile_exclude = [args.tactile_port] if args.tactile_port else None
+            gello_port = resolve_gello_port(
+                args.gello_port,
+                exclude_ports=tactile_exclude,
+            )
+            resolved_gello_port = gello_port
+            print(f"GELLO 串口: {gello_port}")
             agent_cfg = {
                 "_target_": "gello.agents.gello_agent.GelloAgent",
                 "port": gello_port,
@@ -264,7 +303,12 @@ def main(args):
     from gello.utils.control_utils import DiffusionPolicySaveInterface   # 确认这个 import 路径正确
 
     save_interface = None
-    if args.use_save_interface:                  # ← 注意：小写 args，不是 Args
+    if args.use_save_interface:
+        if not args.record_tactile:
+            print(
+                "提示: 未加 --record-tactile 时 zarr 不含触觉；"
+                "训练 tactile 模型请开启 --record-tactile 并重新采集。"
+            )
         print("[DEBUG] use_save_interface = True，正在创建 DiffusionPolicySaveInterface")
         save_interface = DiffusionPolicySaveInterface(
             data_dir=args.data_dir,              # ← 小写 args
@@ -279,8 +323,75 @@ def main(args):
 
     print(f"[DEBUG] 最终 save_interface 类型: {type(save_interface).__name__ if save_interface else 'NoneType'}")
 
+    tactile_runtime = None
+    tactile_limiter = None
+    need_tactile = (args.record_tactile or args.use_tactile_grip_limit) and not args.mock
+    if need_tactile:
+        gello_exclude = [resolved_gello_port] if resolved_gello_port else None
+        tactile_port = resolve_tactile_port(
+            args.tactile_port,
+            exclude_ports=gello_exclude,
+        )
+        from gello.utils.tactile_runtime import TactileRuntime
+
+        tactile_runtime = TactileRuntime(
+            port=tactile_port,
+            baseline_sec=args.tactile_baseline_sec,
+            force_limit_n=args.tactile_force_limit_n,
+            background_poll_hz=args.tactile_background_poll_hz,
+        )
+        if args.record_tactile:
+            print("[Tactile] 已启用：每帧 tactile[6] 写入 zarr")
+        if args.use_tactile_grip_limit:
+            from gello.utils.tactile_gripper_limit import TactileGripperLimiter
+
+            tactile_limiter = TactileGripperLimiter(
+                runtime=tactile_runtime,
+                force_limit_n=args.tactile_force_limit_n,
+                close_increases_command=args.tactile_close_increases,
+            )
+    elif args.record_tactile:
+        raise ValueError("record_tactile 需要真实硬件，请勿使用 --mock")
+
+    runtime_logger = None
+    if args.runtime_log_dir is not None:
+        from gello.utils.runtime_logger import create_runtime_logger
+
+        runtime_logger = create_runtime_logger(
+            args.runtime_log_dir,
+            run_kind="collection",
+            metadata={
+                "python_executable": sys.executable,
+                "python_version": sys.version,
+                "mode": "collection",
+                "args": asdict(args),
+            },
+            flush_interval_s=args.runtime_log_flush_interval_s,
+        )
+        print(f"[RuntimeLogger] {runtime_logger.path}")
+
     # 进入控制循环
-    run_control_loop(env, agent, save_interface, use_colors=True)
+    try:
+        run_control_loop(
+            env,
+            agent,
+            save_interface,
+            use_colors=True,
+            tactile_gripper_limiter=tactile_limiter,
+            tactile_runtime=tactile_runtime if args.record_tactile else None,
+            runtime_logger=runtime_logger,
+        )
+    finally:
+        if tactile_limiter is not None:
+            tactile_limiter.close()
+        if tactile_runtime is not None:
+            tactile_runtime.close()
+        if runtime_logger is not None:
+            runtime_logger.close()
+            if runtime_logger.dropped_events:
+                print(
+                    f"[RuntimeLogger] dropped_events={runtime_logger.dropped_events}"
+                )
 
 if __name__ == "__main__":
     main(tyro.cli(Args))

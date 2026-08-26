@@ -1,0 +1,28 @@
+# Copy this file to a site-specific path, replace every placeholder with the
+# serial printed by a safe RealSense enumeration tool, and pass it explicitly
+# with --camera-config.  This example is never loaded automatically.
+cameras:
+  wrist:
+    serial: "<WristSerial>"
+    port: 5000
+    width: 640
+    height: 480
+    fps: 30
+    flip: false
+    required: true
+  base:
+    serial: "<BaseSerial>"
+    port: 5001
+    width: 640
+    height: 480
+    fps: 30
+    flip: false
+    required: true
+  camera_2:
+    serial: "<ThirdSerial>"
+    port: 5002
+    width: 640
+    height: 480
+    fps: 30
+    flip: false
+    required: true

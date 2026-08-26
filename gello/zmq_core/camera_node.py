@@ -1,17 +1,17 @@
 import pickle
 import threading
+import time
 from typing import Optional, Tuple
 
 import numpy as np
 import zmq
 
-from dataclasses import dataclass
-import tyro
-@dataclass
-class CameraNodeArgs:
-    port:int=5000
-    serial:Optional[str]=None
 from gello.cameras.camera import CameraDriver
+from gello.zmq_core.request_reply import (
+    CameraCommunicationTimeout,
+    RequestReplyClient,
+    serialize_remote_error,
+)
 
 DEFAULT_CAMERA_PORT = 5000
 
@@ -19,10 +19,26 @@ DEFAULT_CAMERA_PORT = 5000
 class ZMQClientCamera(CameraDriver):
     """A class representing a ZMQ client for a leader robot."""
 
-    def __init__(self, port: int = DEFAULT_CAMERA_PORT, host: str = "127.0.0.1"):
-        self._context = zmq.Context()
-        self._socket = self._context.socket(zmq.REQ)
-        self._socket.connect(f"tcp://{host}:{port}")
+    def __init__(
+        self,
+        port: int = DEFAULT_CAMERA_PORT,
+        host: str = "127.0.0.1",
+        recv_timeout_ms: Optional[int] = None,
+        send_timeout_ms: Optional[int] = None,
+        linger_ms: Optional[int] = None,
+    ):
+        self._client = RequestReplyClient(
+            host=host,
+            port=port,
+            recv_timeout_ms=recv_timeout_ms,
+            send_timeout_ms=send_timeout_ms,
+            linger_ms=linger_ms,
+            timeout_error_cls=CameraCommunicationTimeout,
+        )
+
+    @property
+    def connection_ok(self) -> Optional[bool]:
+        return self._client.connection_ok
 
     def read(
         self,
@@ -34,10 +50,16 @@ class ZMQClientCamera(CameraDriver):
             T: The current state of the leader robot.
         """
         # pack the image_size and send it to the server
-        send_message = pickle.dumps(img_size)
-        self._socket.send(send_message)
-        state_dict = pickle.loads(self._socket.recv())
-        return state_dict
+        return self._client.request(img_size, operation="read")
+
+    def ping(self):
+        return self._client.request(
+            {"__gello_camera_method__": "ping"},
+            operation="ping",
+        )
+
+    def close(self) -> None:
+        self._client.close()
 
 
 class ZMQServerCamera:
@@ -60,15 +82,33 @@ class ZMQServerCamera:
     def serve(self) -> None:
         """Serve the leader robot state over ZMQ."""
         self._socket.setsockopt(zmq.RCVTIMEO, 1000)  # Set timeout to 1000 ms
-        while not self._stop_event.is_set():
-            try:
-                message = self._socket.recv()
-                img_size = pickle.loads(message)
-                camera_read = self._camera.read(img_size)
-                self._socket.send(pickle.dumps(camera_read))
-            except zmq.Again:
-                print(self._timout_message)
-                # Timeout occurred, check if the stop event is set
+        try:
+            while not self._stop_event.is_set():
+                try:
+                    message = self._socket.recv()
+                    try:
+                        request = pickle.loads(message)
+                        if (
+                            isinstance(request, dict)
+                            and request.get("__gello_camera_method__") == "ping"
+                        ):
+                            result = {
+                                "server_alive": True,
+                                "server_monotonic_ns": time.monotonic_ns(),
+                            }
+                        else:
+                            # Raw img_size payload is retained for wire compatibility.
+                            result = self._camera.read(request)
+                    except Exception as exc:
+                        print(f"Camera RPC failed: {type(exc).__name__}: {exc}")
+                        result = serialize_remote_error(exc)
+                    self._socket.send(pickle.dumps(result))
+                except zmq.Again:
+                    print(self._timout_message)
+                    # Timeout occurred, check if the stop event is set
+        finally:
+            self._socket.close(linger=0)
+            self._context.term()
 
     def stop(self) -> None:
         """Signal the server to stop serving."""

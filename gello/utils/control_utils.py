@@ -126,6 +126,8 @@ class DiffusionPolicySaveInterface:
                 episode[key] = np.stack(lst, axis=0)  # (T, H, W, 3) uint8
             elif key == "gripper_position":
                 episode[key] = np.stack(lst, axis=0).reshape(-1, 1)  # (T, 1)
+            elif key == "tactile":
+                episode[key] = np.stack(lst, axis=0).astype(np.float32)  # (T, 6)
             else:
                 episode[key] = np.stack(lst, axis=0)  # robot_joint/action (T, 7)
 
@@ -298,6 +300,15 @@ class DiffusionPolicySaveInterface:
             self.current_episode.setdefault("gripper_position", []).append(gripper)   # (1,)
             self.current_episode.setdefault("action", []).append(act)                 # (7,)
 
+            if "tactile" in obs:
+                tactile = np.asarray(obs["tactile"], dtype=np.float32).reshape(-1)
+                if tactile.shape[0] != 6:
+                    print(f"警告：tactile 维度 {tactile.shape}，已截断/补零到 6")
+                    fixed = np.zeros(6, dtype=np.float32)
+                    fixed[: min(6, tactile.shape[0])] = tactile[:6]
+                    tactile = fixed
+                self.current_episode.setdefault("tactile", []).append(tactile)
+
             self.current_timestamps.append(current_time)
 
             # === 3. npz 备份（调试用）===
@@ -344,6 +355,9 @@ def run_control_loop(
     save_interface: Optional[DiffusionPolicySaveInterface] = None,
     print_timing: bool = True,
     use_colors: bool = False,
+    tactile_gripper_limiter: Optional[Any] = None,
+    tactile_runtime: Optional[Any] = None,
+    runtime_logger: Optional[Any] = None,
 ) -> None:
     """Run the main control loop."""
     colors_available = False
@@ -360,9 +374,23 @@ def run_control_loop(
     print(start_msg)
     start_time = time.time()
     obs = env.get_obs()
+    loop_count = 0
+    loop_rate_t0 = time.time()
 
     try:
         while True:
+            loop_started_ns = time.monotonic_ns() if runtime_logger is not None else None
+            loop_count += 1
+            if tactile_runtime is not None and loop_count % 500 == 0:
+                elapsed = time.time() - loop_rate_t0
+                if elapsed > 0:
+                    print(
+                        f"\n[Loop] 主循环 ~{loop_count / elapsed:.1f} Hz "
+                        f"(触觉由后台线程轮询，不再阻塞 teleop)"
+                    )
+                loop_count = 0
+                loop_rate_t0 = time.time()
+
             if print_timing:
                 num = time.time() - start_time
                 message = f"\rTime passed: {round(num, 2)}          "
@@ -371,15 +399,67 @@ def run_control_loop(
                 else:
                     print(message, end="", flush=True)
 
-            action = agent.act(obs)
+            loop_obs = obs
+            tactile_max_force_n = None
+            tactile_src = tactile_runtime
+            if tactile_src is None and tactile_gripper_limiter is not None:
+                tactile_src = tactile_gripper_limiter.runtime
+            if tactile_src is not None:
+                sample = tactile_src.read_sample()
+                loop_obs = dict(obs)
+                loop_obs["tactile_max_force_n"] = sample.max_force_n
+                tactile_max_force_n = sample.max_force_n
+                if tactile_runtime is not None:
+                    loop_obs["tactile"] = sample.vector6
+
+            action = agent.act(loop_obs)
+            raw_action = np.asarray(action).copy() if runtime_logger is not None else None
+
+            if tactile_gripper_limiter is not None:
+                action = tactile_gripper_limiter.apply_limit(action, loop_obs)
+
+            command_action = (
+                np.asarray(action).copy() if runtime_logger is not None else None
+            )
+            robot_q_before = (
+                np.asarray(obs.get("joints")).copy()
+                if runtime_logger is not None and "joints" in obs
+                else None
+            )
+
+            if save_interface is not None and tactile_runtime is not None:
+                obs_for_save = loop_obs
+            else:
+                obs_for_save = obs
 
             if save_interface is not None:
-                result = save_interface.update(obs, action)
+                result = save_interface.update(obs_for_save, action)
                 if result == "quit":
                     break
 
             obs = env.step(action)
+            if runtime_logger is not None:
+                robot_q_after = (
+                    np.asarray(obs.get("joints")).copy()
+                    if "joints" in obs
+                    else None
+                )
+                limiter_changed = not np.array_equal(raw_action, command_action)
+                runtime_logger.log(
+                    "teleop_step",
+                    loop_duration_ms=(time.monotonic_ns() - loop_started_ns) / 1e6,
+                    robot_q_before=robot_q_before,
+                    raw_action=raw_action,
+                    sent_command=command_action,
+                    robot_q_after=robot_q_after,
+                    tactile_max_force_n=tactile_max_force_n,
+                    tactile_limiter_changed=limiter_changed,
+                )
     except KeyboardInterrupt:
         print("\n>>> KeyboardInterrupt detected, shutting down safely... <<<")
         if save_interface is not None:
             save_interface.finalize_on_exit(reason="KeyboardInterrupt")
+        if tactile_gripper_limiter is not None:
+            tactile_gripper_limiter.close()
+        if tactile_runtime is not None:
+            tactile_runtime.close()
