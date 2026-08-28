@@ -463,6 +463,94 @@ class URRobot(Robot):
             "gripper_position": gripper_pos,
         }
 
+    def get_health(self) -> Dict[str, object]:
+        """Return a read-only snapshot of RTDE and gripper process health."""
+
+        errors: Dict[str, str] = {}
+
+        def read_bool(interface, method_name: str, key: str) -> bool:
+            try:
+                return bool(getattr(interface, method_name)())
+            except Exception as exc:
+                errors[key] = f"{type(exc).__name__}: {exc}"
+                return False
+
+        def read_scalar(interface, method_name: str, key: str):
+            try:
+                value = getattr(interface, method_name)()
+                if isinstance(value, np.generic):
+                    return value.item()
+                if isinstance(value, (bool, int, float, str)) or value is None:
+                    return value
+                try:
+                    return int(value)
+                except (TypeError, ValueError):
+                    return str(value)
+            except Exception as exc:
+                errors[key] = f"{type(exc).__name__}: {exc}"
+                return None
+
+        control = getattr(self, "robot", None)
+        receiver = getattr(self, "r_inter", None)
+        control_connected = (
+            read_bool(control, "isConnected", "control_connected")
+            if control is not None
+            else False
+        )
+        receive_connected = (
+            read_bool(receiver, "isConnected", "receive_connected")
+            if receiver is not None
+            else False
+        )
+
+        emergency_stopped = (
+            read_bool(receiver, "isEmergencyStopped", "emergency_stopped")
+            if receiver is not None
+            else False
+        )
+        protective_stopped = (
+            read_bool(receiver, "isProtectiveStopped", "protective_stopped")
+            if receiver is not None
+            else False
+        )
+
+        health: Dict[str, object] = {
+            "robot_connected": control_connected and receive_connected,
+            "control_connected": control_connected,
+            "receive_connected": receive_connected,
+            "robot_mode": (
+                read_scalar(receiver, "getRobotMode", "robot_mode")
+                if receiver is not None
+                else None
+            ),
+            "runtime_state": (
+                read_scalar(receiver, "getRuntimeState", "runtime_state")
+                if receiver is not None
+                else None
+            ),
+            "safety_mode": (
+                read_scalar(receiver, "getSafetyMode", "safety_mode")
+                if receiver is not None
+                else None
+            ),
+            "emergency_stopped": emergency_stopped,
+            "protective_stopped": protective_stopped,
+            "operational": (
+                control_connected
+                and receive_connected
+                and not emergency_stopped
+                and not protective_stopped
+            ),
+            "gripper_process_alive": (
+                bool(self.p_gripper.is_alive())
+                if getattr(self, "p_gripper", None) is not None
+                else None
+            ),
+        }
+        if errors:
+            health["errors"] = errors
+        return health
+
 
 def main():
     robot_ip = "192.168.1.101"

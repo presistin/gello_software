@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pickle
+import time
 from typing import Any, Optional, Type
 
 import zmq
@@ -96,6 +97,7 @@ class RequestReplyClient:
         self.linger_ms = _validate_timeout("linger_ms", linger_ms, allow_zero=True)
         self.timeout_error_cls = timeout_error_cls
         self.connection_ok: Optional[bool] = None
+        self.last_request_timing: Optional[dict] = None
         self._closed = False
         self._context = zmq.Context()
         self._socket = self._create_socket()
@@ -124,10 +126,18 @@ class RequestReplyClient:
             raise ZMQCommunicationError(
                 f"ZMQ request '{operation}' attempted after client close: {self.endpoint}"
             )
+        request_started_ns = time.monotonic_ns()
         try:
             self._socket.send(pickle.dumps(payload))
+            send_completed_ns = time.monotonic_ns()
         except zmq.Again as exc:
             self.connection_ok = False
+            self.last_request_timing = {
+                "operation": operation,
+                "request_started_ns": request_started_ns,
+                "failed_ns": time.monotonic_ns(),
+                "phase": "send",
+            }
             self._reset_socket()
             raise self.timeout_error_cls(
                 endpoint=self.endpoint,
@@ -137,6 +147,12 @@ class RequestReplyClient:
             ) from exc
         except zmq.ZMQError as exc:
             self.connection_ok = False
+            self.last_request_timing = {
+                "operation": operation,
+                "request_started_ns": request_started_ns,
+                "failed_ns": time.monotonic_ns(),
+                "phase": "send",
+            }
             self._reset_socket()
             raise ZMQCommunicationError(
                 f"ZMQ send failed during '{operation}' at {self.endpoint}: {exc}"
@@ -144,8 +160,16 @@ class RequestReplyClient:
 
         try:
             reply = self._socket.recv()
+            reply_received_ns = time.monotonic_ns()
         except zmq.Again as exc:
             self.connection_ok = False
+            self.last_request_timing = {
+                "operation": operation,
+                "request_started_ns": request_started_ns,
+                "send_completed_ns": send_completed_ns,
+                "failed_ns": time.monotonic_ns(),
+                "phase": "receive",
+            }
             self._reset_socket()
             raise self.timeout_error_cls(
                 endpoint=self.endpoint,
@@ -155,6 +179,13 @@ class RequestReplyClient:
             ) from exc
         except zmq.ZMQError as exc:
             self.connection_ok = False
+            self.last_request_timing = {
+                "operation": operation,
+                "request_started_ns": request_started_ns,
+                "send_completed_ns": send_completed_ns,
+                "failed_ns": time.monotonic_ns(),
+                "phase": "receive",
+            }
             self._reset_socket()
             raise ZMQCommunicationError(
                 f"ZMQ receive failed during '{operation}' at {self.endpoint}: {exc}"
@@ -170,6 +201,13 @@ class RequestReplyClient:
             ) from exc
 
         self.connection_ok = True
+        self.last_request_timing = {
+            "operation": operation,
+            "request_started_ns": request_started_ns,
+            "send_completed_ns": send_completed_ns,
+            "reply_received_ns": reply_received_ns,
+            "round_trip_ms": (reply_received_ns - request_started_ns) / 1e6,
+        }
         raise_for_remote_error(result, operation=operation)
         return result
 

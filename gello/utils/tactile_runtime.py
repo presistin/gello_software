@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Tuple
 
 import numpy as np
@@ -26,6 +26,8 @@ from gello.sensors.tactile_vector import TACTILE_DIM, distribution_to_vector6
 class TactileSample:
     vector6: np.ndarray
     max_force_n: float
+    monotonic_ns: int = field(default_factory=time.monotonic_ns)
+    valid_sensor_count: int = 0
 
 
 class TactileRuntime:
@@ -115,16 +117,23 @@ class TactileRuntime:
         """读所有传感器一次，同时得到 6 维向量与 max‖ΔF‖。"""
         out = np.zeros(TACTILE_DIM, dtype=np.float32)
         peak = 0.0
+        valid_sensor_count = 0
         for i, slot in enumerate(self.sensors):
             pts = self._board.read_distribution(slot)
             base = self._baselines.get(slot.key)
             if pts is None or base is None:
                 continue
+            valid_sensor_count += 1
             delta = pts - base
             self._maybe_adapt_baseline(slot, pts, delta)
             peak = max(peak, float(np.linalg.norm(delta, axis=1).max()))
             out[i * 3 : (i + 1) * 3] = distribution_to_vector6(pts, base)
-        return TactileSample(vector6=out, max_force_n=peak)
+        return TactileSample(
+            vector6=out,
+            max_force_n=peak,
+            monotonic_ns=time.monotonic_ns(),
+            valid_sensor_count=valid_sensor_count,
+        )
 
     def read_sample(self) -> TactileSample:
         """主循环调用：有后台线程时取缓存（非阻塞），否则同步读一次。"""
@@ -134,6 +143,8 @@ class TactileRuntime:
                     return TactileSample(
                         vector6=self._latest.vector6.copy(),
                         max_force_n=self._latest.max_force_n,
+                        monotonic_ns=self._latest.monotonic_ns,
+                        valid_sensor_count=self._latest.valid_sensor_count,
                     )
         return self._read_sample_blocking()
 

@@ -202,6 +202,22 @@ class DiffusionPolicySaveInterface:
         self._save_queue.join()
         print("✅ All pending episodes written to replay_buffer.zarr")
 
+    def discard_current_episode_on_fault(self, reason: str) -> None:
+        """Discard only the in-progress episode after a control-path fault.
+
+        A communication failure can occur after an action was recorded but
+        before the robot confirmed the corresponding observation.  Saving that
+        partial episode would create an ambiguous action/observation pair.
+        Previously completed episodes and already queued saves are preserved.
+        """
+
+        if self.in_recording:
+            print(
+                f"\n>>> Discarding in-progress episode after {reason} "
+                f"(length: {len(self.current_timestamps)}) <<<"
+            )
+            self._reset_episode_buffer()
+
     def update(self, obs: Dict[str, Any], action: np.ndarray) -> Optional[str]:
         if self._save_failed:
             raise RuntimeError(
@@ -357,6 +373,9 @@ def run_control_loop(
     use_colors: bool = False,
     tactile_gripper_limiter: Optional[Any] = None,
     tactile_runtime: Optional[Any] = None,
+    safety_tactile_runtime: Optional[Any] = None,
+    safety_supervisor: Optional[Any] = None,
+    safety_mode: str = "legacy",
     runtime_logger: Optional[Any] = None,
 ) -> None:
     """Run the main control loop."""
@@ -379,7 +398,11 @@ def run_control_loop(
 
     try:
         while True:
-            loop_started_ns = time.monotonic_ns() if runtime_logger is not None else None
+            loop_started_ns = (
+                time.monotonic_ns()
+                if runtime_logger is not None or safety_supervisor is not None
+                else None
+            )
             loop_count += 1
             if tactile_runtime is not None and loop_count % 500 == 0:
                 elapsed = time.time() - loop_rate_t0
@@ -401,11 +424,15 @@ def run_control_loop(
 
             loop_obs = obs
             tactile_max_force_n = None
+            tactile_sample = None
             tactile_src = tactile_runtime
             if tactile_src is None and tactile_gripper_limiter is not None:
                 tactile_src = tactile_gripper_limiter.runtime
+            if tactile_src is None:
+                tactile_src = safety_tactile_runtime
             if tactile_src is not None:
                 sample = tactile_src.read_sample()
+                tactile_sample = sample
                 loop_obs = dict(obs)
                 loop_obs["tactile_max_force_n"] = sample.max_force_n
                 tactile_max_force_n = sample.max_force_n
@@ -413,19 +440,64 @@ def run_control_loop(
                     loop_obs["tactile"] = sample.vector6
 
             action = agent.act(loop_obs)
-            raw_action = np.asarray(action).copy() if runtime_logger is not None else None
+            keep_action_copies = runtime_logger is not None or safety_supervisor is not None
+            raw_action = np.asarray(action).copy() if keep_action_copies else None
 
             if tactile_gripper_limiter is not None:
                 action = tactile_gripper_limiter.apply_limit(action, loop_obs)
 
-            command_action = (
-                np.asarray(action).copy() if runtime_logger is not None else None
+            legacy_action = (
+                np.asarray(action).copy() if keep_action_copies else None
             )
             robot_q_before = (
                 np.asarray(obs.get("joints")).copy()
-                if runtime_logger is not None and "joints" in obs
+                if keep_action_copies and "joints" in obs
                 else None
             )
+            input_observation_timing = (
+                env.get_last_observation_timing()
+                if safety_supervisor is not None or runtime_logger is not None
+                else None
+            )
+            safety_action = None
+            safety_events = ()
+            safety_faulted = False
+            if safety_supervisor is not None:
+                decision = safety_supervisor.filter_action(
+                    raw_action,
+                    current_state=robot_q_before,
+                    tactile_sample=tactile_sample,
+                    observation_timing=input_observation_timing,
+                    now_ns=time.monotonic_ns(),
+                    check_cameras=True,
+                    check_robot=True,
+                    check_tactile=True,
+                )
+                safety_action = decision.safe_action
+                safety_events = decision.events
+                safety_faulted = decision.faulted
+
+            if safety_mode == "enforce" and safety_supervisor is not None:
+                command_action = safety_action
+            else:
+                command_action = legacy_action if keep_action_copies else action
+
+            if safety_faulted and safety_mode == "enforce":
+                if runtime_logger is not None:
+                    runtime_logger.log(
+                        "safety_hold",
+                        mode="collection",
+                        raw_action=raw_action,
+                        legacy_action=legacy_action,
+                        safety_action=safety_action,
+                        safety_events=safety_events,
+                        observation_timing=input_observation_timing,
+                    )
+                env.robot().command_joint_state(safety_action)
+                from gello.safety import SafetyFault
+
+                codes = [event.get("code") for event in safety_events]
+                raise SafetyFault(f"events={codes}")
 
             if save_interface is not None and tactile_runtime is not None:
                 obs_for_save = loop_obs
@@ -433,27 +505,48 @@ def run_control_loop(
                 obs_for_save = obs
 
             if save_interface is not None:
-                result = save_interface.update(obs_for_save, action)
+                result = save_interface.update(obs_for_save, command_action)
                 if result == "quit":
                     break
 
-            obs = env.step(action)
+            obs = env.step(command_action)
             if runtime_logger is not None:
+                event_ready_ns = time.monotonic_ns()
                 robot_q_after = (
                     np.asarray(obs.get("joints")).copy()
                     if "joints" in obs
                     else None
                 )
-                limiter_changed = not np.array_equal(raw_action, command_action)
+                limiter_changed = not np.array_equal(raw_action, legacy_action)
+                tactile_timing = None
+                if tactile_sample is not None:
+                    tactile_timing = {
+                        "source_monotonic_ns": tactile_sample.monotonic_ns,
+                        "age_ms": (
+                            event_ready_ns - tactile_sample.monotonic_ns
+                        )
+                        / 1e6,
+                        "valid_sensor_count": (
+                            tactile_sample.valid_sensor_count
+                        ),
+                    }
                 runtime_logger.log(
                     "teleop_step",
-                    loop_duration_ms=(time.monotonic_ns() - loop_started_ns) / 1e6,
+                    loop_duration_ms=(event_ready_ns - loop_started_ns) / 1e6,
                     robot_q_before=robot_q_before,
                     raw_action=raw_action,
+                    legacy_action=legacy_action,
+                    safety_action=safety_action,
                     sent_command=command_action,
+                    safety_mode=safety_mode,
+                    safety_events=safety_events,
+                    safety_faulted=safety_faulted,
                     robot_q_after=robot_q_after,
                     tactile_max_force_n=tactile_max_force_n,
                     tactile_limiter_changed=limiter_changed,
+                    input_observation_timing=input_observation_timing,
+                    observation_timing=env.get_last_observation_timing(),
+                    tactile_timing=tactile_timing,
                 )
     except KeyboardInterrupt:
         print("\n>>> KeyboardInterrupt detected, shutting down safely... <<<")

@@ -10,6 +10,7 @@ from typing import Optional
 
 import numpy as np
 
+from gello.safety.safety_supervisor import limit_gripper_by_force
 from gello.utils.tactile_runtime import TactileRuntime
 
 
@@ -44,13 +45,15 @@ class TactileGripperLimiter:
         else:
             force_n = self.runtime.get_max_force_n()
 
-        if self.close_increases_command:
-            wants_close_more = leader_g > follower_g + 1e-4
-        else:
-            wants_close_more = leader_g < follower_g - 1e-4
+        out, limited = limit_gripper_by_force(
+            out,
+            current_gripper=follower_g,
+            force_n=force_n,
+            force_limit_n=self.force_limit_n,
+            close_increases_command=self.close_increases_command,
+        )
 
-        if force_n >= self.force_limit_n and wants_close_more:
-            out[-1] = follower_g
+        if limited:
             if not self._limited_last:
                 print(
                     f"\n[TactileGripper] 达到 {force_n:.2f} N >= {self.force_limit_n:.2f} N，"

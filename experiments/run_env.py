@@ -12,6 +12,7 @@ from gello.robots.robot import PrintRobot
 from gello.utils.launch_utils import instantiate_from_dict
 from gello.utils.serial_ports import resolve_gello_port, resolve_tactile_port
 from gello.zmq_core.robot_node import ZMQClientRobot
+from gello.zmq_core.request_reply import ZMQCommunicationError
 #添加相机类
 from gello.zmq_core.camera_node import ZMQClientCamera
 
@@ -51,6 +52,11 @@ class Args:
     runtime_log_dir: Optional[str] = None
     runtime_log_flush_interval_s: float = 1.0
 
+    # FIX004 staged rollout. legacy preserves the existing command path;
+    # shadow computes/logs safety output; enforce sends the safety output.
+    safety_mode: str = "legacy"
+    safety_config: Optional[str] = None
+
     # 触觉（高速板 + M3025）：record_tactile 写入 zarr 供 DP 训练；use_tactile_grip_limit 采集防卡死
     record_tactile: bool = False
     """为 True 时每帧将 6 维触觉向量存入 replay_buffer.zarr（需重新采集）。"""
@@ -68,6 +74,53 @@ class Args:
 
 
 def main(args):
+    from gello.safety import (
+        SafetyFault,
+        SafetySupervisor,
+        load_safety_config,
+        normalize_safety_mode,
+    )
+
+    safety_mode = normalize_safety_mode(args.safety_mode)
+    safety_config = (
+        load_safety_config(args.safety_config)
+        if safety_mode != "legacy"
+        else None
+    )
+    safety_supervisor = (
+        SafetySupervisor(safety_config) if safety_config is not None else None
+    )
+    capture_timestamps = args.runtime_log_dir is not None or safety_supervisor is not None
+    if safety_supervisor is not None and args.mock:
+        raise ValueError("shadow/enforce safety modes require real robot and sensor timing")
+    if safety_supervisor is not None and args.bimanual:
+        raise ValueError(
+            "FIX004 SafetySupervisor currently supports the configured 7D UR arm only"
+        )
+    if safety_supervisor is not None and not (
+        args.record_tactile or args.use_tactile_grip_limit
+    ):
+        raise ValueError(
+            "shadow/enforce safety modes require the M3025 runtime; add "
+            "--record-tactile and/or --use-tactile-grip-limit"
+        )
+    if safety_supervisor is not None:
+        print(
+            f"[Safety] mode={safety_mode} config="
+            f"{args.safety_config or 'config/safety.yaml'} "
+            f"joint_step={safety_config.max_joint_step_rad:.3f} rad "
+            f"grip_force={safety_config.tactile_grip_limit_n:.2f} N "
+            f"ages(camera/tactile/robot)="
+            f"{safety_config.max_camera_age_ms:.0f}/"
+            f"{safety_config.max_tactile_age_ms:.0f}/"
+            f"{safety_config.max_robot_age_ms:.0f} ms"
+        )
+        if safety_mode == "shadow" and args.runtime_log_dir is None:
+            print(
+                "[Safety] WARNING: shadow mode has no --runtime-log-dir; "
+                "comparisons will not be persisted."
+            )
+
     if args.mock:
         robot_client = PrintRobot(8, dont_print=True)
         camera_clients = {}
@@ -81,18 +134,21 @@ def main(args):
                 host=args.hostname,
                 recv_timeout_ms=args.camera_recv_timeout_ms,
                 send_timeout_ms=args.camera_send_timeout_ms,
+                capture_timestamps=capture_timestamps,
             ),
             "base": ZMQClientCamera(
                 port=args.base_camera_port,
                 host=args.hostname,
                 recv_timeout_ms=args.camera_recv_timeout_ms,
                 send_timeout_ms=args.camera_send_timeout_ms,
+                capture_timestamps=capture_timestamps,
             ),
             "camera_2": ZMQClientCamera(
                 port=5002,
                 host=args.hostname,
                 recv_timeout_ms=args.camera_recv_timeout_ms,
                 send_timeout_ms=args.camera_send_timeout_ms,
+                capture_timestamps=capture_timestamps,
             ),                 # 新增
             # "camera_3": ZMQClientCamera(port=5003, host=args.hostname),
         }
@@ -101,8 +157,14 @@ def main(args):
             host=args.hostname,
             recv_timeout_ms=args.robot_recv_timeout_ms,
             send_timeout_ms=args.robot_send_timeout_ms,
+            capture_timestamps=capture_timestamps,
         )
-    env = RobotEnv(robot_client, control_rate_hz=args.hz, camera_dict=camera_clients)
+    env = RobotEnv(
+        robot_client,
+        control_rate_hz=args.hz,
+        camera_dict=camera_clients,
+        capture_timestamps=capture_timestamps,
+    )
 
     resolved_gello_port: Optional[str] = None
     agent_cfg = {}
@@ -325,7 +387,11 @@ def main(args):
 
     tactile_runtime = None
     tactile_limiter = None
-    need_tactile = (args.record_tactile or args.use_tactile_grip_limit) and not args.mock
+    need_tactile = (
+        args.record_tactile
+        or args.use_tactile_grip_limit
+        or safety_supervisor is not None
+    ) and not args.mock
     if need_tactile:
         gello_exclude = [resolved_gello_port] if resolved_gello_port else None
         tactile_port = resolve_tactile_port(
@@ -365,6 +431,10 @@ def main(args):
                 "python_version": sys.version,
                 "mode": "collection",
                 "args": asdict(args),
+                "safety_mode": safety_mode,
+                "safety_config": (
+                    safety_config.to_dict() if safety_config is not None else None
+                ),
             },
             flush_interval_s=args.runtime_log_flush_interval_s,
         )
@@ -379,8 +449,46 @@ def main(args):
             use_colors=True,
             tactile_gripper_limiter=tactile_limiter,
             tactile_runtime=tactile_runtime if args.record_tactile else None,
+            safety_tactile_runtime=tactile_runtime,
+            safety_supervisor=safety_supervisor,
+            safety_mode=safety_mode,
             runtime_logger=runtime_logger,
         )
+    except SafetyFault as exc:
+        if runtime_logger is not None:
+            runtime_logger.log(
+                "safety_fault",
+                mode="collection",
+                message=str(exc),
+            )
+        print(
+            "\n[FAULT] Collection safety supervisor stopped command output; "
+            "one current-state hold was sent and no further targets will be sent."
+        )
+        print(f"[FAULT] SafetyFault: {exc}")
+        if save_interface is not None:
+            save_interface.discard_current_episode_on_fault(reason="SafetyFault")
+            save_interface.finalize_on_exit(reason="safety fault")
+        raise SystemExit(3) from None
+    except ZMQCommunicationError as exc:
+        if runtime_logger is not None:
+            runtime_logger.log(
+                "communication_fault",
+                mode="collection",
+                error_type=type(exc).__name__,
+                message=str(exc),
+            )
+        print(
+            "\n[FAULT] Collection communication failed; "
+            "no further robot targets will be sent."
+        )
+        print(f"[FAULT] {type(exc).__name__}: {exc}")
+        if save_interface is not None:
+            save_interface.discard_current_episode_on_fault(
+                reason=type(exc).__name__
+            )
+            save_interface.finalize_on_exit(reason="communication fault")
+        raise SystemExit(2) from None
     finally:
         if tactile_limiter is not None:
             tactile_limiter.close()

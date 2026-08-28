@@ -1,0 +1,15 @@
+safety:
+  # Measured from FIX003 logs on 2026-08-26; do not replace with guesses.
+  tactile_grip_limit_n: 0.5
+  max_joint_step_rad: 0.16
+  max_camera_age_ms: 100.0
+  max_tactile_age_ms: 120.0
+  max_robot_age_ms: 10.0
+
+  # OnRobot normalized command: larger value closes the gripper.
+  gripper_close_increases: true
+  expected_tactile_sensor_count: 2
+  required_cameras:
+    - wrist
+    - base
+    - camera_2

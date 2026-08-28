@@ -84,6 +84,18 @@ class PrintRobot(Robot):
             "gripper_position": np.array(0),
         }
 
+    def get_health(self) -> Dict[str, object]:
+        """Expose an explicit simulated health snapshot for dry-run nodes."""
+
+        return {
+            "robot_connected": True,
+            "operational": True,
+            "emergency_stopped": False,
+            "protective_stopped": False,
+            "gripper_process_alive": None,
+            "simulated": True,
+        }
+
 
 class BimanualRobot(Robot):
     def __init__(self, robot_l: Robot, robot_r: Robot):

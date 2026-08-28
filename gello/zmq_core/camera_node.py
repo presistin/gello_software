@@ -1,7 +1,7 @@
 import pickle
 import threading
 import time
-from typing import Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 import zmq
@@ -10,6 +10,7 @@ from gello.cameras.camera import CameraDriver
 from gello.zmq_core.request_reply import (
     CameraCommunicationTimeout,
     RequestReplyClient,
+    ZMQProtocolError,
     serialize_remote_error,
 )
 
@@ -26,6 +27,7 @@ class ZMQClientCamera(CameraDriver):
         recv_timeout_ms: Optional[int] = None,
         send_timeout_ms: Optional[int] = None,
         linger_ms: Optional[int] = None,
+        capture_timestamps: bool = False,
     ):
         self._client = RequestReplyClient(
             host=host,
@@ -35,6 +37,8 @@ class ZMQClientCamera(CameraDriver):
             linger_ms=linger_ms,
             timeout_error_cls=CameraCommunicationTimeout,
         )
+        self._capture_timestamps = bool(capture_timestamps)
+        self._last_frame_timing: Optional[Dict[str, Any]] = None
 
     @property
     def connection_ok(self) -> Optional[bool]:
@@ -49,8 +53,38 @@ class ZMQClientCamera(CameraDriver):
         Returns:
             T: The current state of the leader robot.
         """
-        # pack the image_size and send it to the server
-        return self._client.request(img_size, operation="read")
+        if not self._capture_timestamps:
+            # Raw img_size payload retains the historical wire protocol.
+            self._last_frame_timing = None
+            return self._client.request(img_size, operation="read")
+
+        result = self._client.request(
+            {
+                "__gello_camera_method__": "read_with_metadata",
+                "img_size": img_size,
+            },
+            operation="read_with_metadata",
+        )
+        if not isinstance(result, dict) or not {"image", "depth", "timing"} <= set(result):
+            raise ZMQProtocolError(
+                "Camera read_with_metadata returned an invalid response at "
+                f"{self._client.endpoint}"
+            )
+        timing = dict(result["timing"])
+        request_timing = self._client.last_request_timing or {}
+        timing.update(
+            {
+                "client_request_started_ns": request_timing.get("request_started_ns"),
+                "client_reply_received_ns": request_timing.get("reply_received_ns"),
+                "round_trip_ms": request_timing.get("round_trip_ms"),
+            }
+        )
+        self._last_frame_timing = timing
+        return result["image"], result["depth"]
+
+    @property
+    def last_frame_timing(self) -> Optional[Dict[str, Any]]:
+        return None if self._last_frame_timing is None else dict(self._last_frame_timing)
 
     def ping(self):
         return self._client.request(
@@ -95,6 +129,24 @@ class ZMQServerCamera:
                             result = {
                                 "server_alive": True,
                                 "server_monotonic_ns": time.monotonic_ns(),
+                            }
+                        elif (
+                            isinstance(request, dict)
+                            and request.get("__gello_camera_method__")
+                            == "read_with_metadata"
+                        ):
+                            read_started_ns = time.monotonic_ns()
+                            image, depth = self._camera.read(request.get("img_size"))
+                            read_completed_ns = time.monotonic_ns()
+                            result = {
+                                "image": image,
+                                "depth": depth,
+                                "timing": {
+                                    "read_started_ns": read_started_ns,
+                                    "source_monotonic_ns": read_completed_ns,
+                                    "source_event": "camera_read_completed",
+                                    "server_reply_monotonic_ns": time.monotonic_ns(),
+                                },
                             }
                         else:
                             # Raw img_size payload is retained for wire compatibility.

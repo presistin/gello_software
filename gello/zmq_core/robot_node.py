@@ -10,6 +10,7 @@ from gello.robots.robot import Robot
 from gello.zmq_core.request_reply import (
     RequestReplyClient,
     RobotCommunicationTimeout,
+    ZMQProtocolError,
     serialize_remote_error,
 )
 
@@ -66,12 +67,31 @@ class ZMQServerRobot:
             return self._robot.command_joint_state(**args)
         if method == "get_observations":
             return self._robot.get_observations()
+        if method == "get_observations_with_metadata":
+            read_started_ns = time.monotonic_ns()
+            observations = self._robot.get_observations()
+            read_completed_ns = time.monotonic_ns()
+            return {
+                "observations": observations,
+                "timing": {
+                    "read_started_ns": read_started_ns,
+                    "source_monotonic_ns": read_completed_ns,
+                    "source_event": "robot_observation_read_completed",
+                    "server_reply_monotonic_ns": time.monotonic_ns(),
+                },
+            }
         if method == "ping":
             health_method = getattr(self._robot, "get_health", None)
             robot_health = health_method() if callable(health_method) else None
+            robot_connected = (
+                robot_health.get("robot_connected")
+                if isinstance(robot_health, dict)
+                else None
+            )
             return {
                 "server_alive": True,
                 "server_monotonic_ns": time.monotonic_ns(),
+                "robot_connected": robot_connected,
                 "robot_health": robot_health,
             }
         raise NotImplementedError(f"Invalid method: {method}, args={args}")
@@ -91,6 +111,7 @@ class ZMQClientRobot(Robot):
         recv_timeout_ms: Optional[int] = None,
         send_timeout_ms: Optional[int] = None,
         linger_ms: Optional[int] = None,
+        capture_timestamps: bool = False,
     ):
         self._client = RequestReplyClient(
             host=host,
@@ -100,6 +121,8 @@ class ZMQClientRobot(Robot):
             linger_ms=linger_ms,
             timeout_error_cls=RobotCommunicationTimeout,
         )
+        self._capture_timestamps = bool(capture_timestamps)
+        self._last_observation_timing: Optional[Dict[str, Any]] = None
 
     @property
     def connection_ok(self) -> Optional[bool]:
@@ -144,7 +167,33 @@ class ZMQClientRobot(Robot):
         Returns:
             Dict[str, np.ndarray]: The current observations of the leader robot.
         """
-        return self._request("get_observations")
+        if not self._capture_timestamps:
+            self._last_observation_timing = None
+            return self._request("get_observations")
+
+        result = self._request("get_observations_with_metadata")
+        if not isinstance(result, dict) or not {"observations", "timing"} <= set(result):
+            raise ZMQProtocolError(
+                "Robot get_observations_with_metadata returned an invalid response at "
+                f"{self._client.endpoint}"
+            )
+        timing = dict(result["timing"])
+        request_timing = self._client.last_request_timing or {}
+        timing.update(
+            {
+                "client_request_started_ns": request_timing.get("request_started_ns"),
+                "client_reply_received_ns": request_timing.get("reply_received_ns"),
+                "round_trip_ms": request_timing.get("round_trip_ms"),
+            }
+        )
+        self._last_observation_timing = timing
+        return result["observations"]
+
+    @property
+    def last_observation_timing(self) -> Optional[Dict[str, Any]]:
+        if self._last_observation_timing is None:
+            return None
+        return dict(self._last_observation_timing)
 
     def ping(self) -> Dict[str, Any]:
         return self._request("ping")
